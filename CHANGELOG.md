@@ -1,5 +1,69 @@
 # Changelog
 
+## 0.4.11 — 2026-10-31
+
+- **修 token 统计虚高（会话面板 TPS 两万多 tok/s）**：上游的 `total_tokens` 不是本轮
+  用量，而是**当前上下文大小** —— 实测一条 `cached 42240 + prompt 1097 + completion 226
+  = 43563` 完全对上。插件原样透传后，客户端把每轮的「上下文大小」累加，70 步的会话
+  显示 13.8M tokens（实际仅 471K 输入 + 187K 输出），TPS 被算成 21074 tok/s。
+  现在按 magpie 其它插件的约定自己算：`total_tokens = prompt_tokens + completion_tokens`，
+  两轮实测 `128 = 37+91`、`249 = 42+207`，不再随会话增长。
+- 新增 1 条回归断言；测试 63 通过（真上游 2 条在有 cookie 时跑）。
+
+## 0.4.10 — 2026-10-31
+
+- **CI 增加真上游集成测试**（`tests/live.test.mjs` + workflow 里的 `live` job）。
+  单测全打桩，桩永远比真上游宽容 —— 历史上「工具 schema 被上游拒」就是这么漏的。
+  现在每次 push、每个同仓库 PR、以及每天定时跑两条真请求：
+  ① 把 anyOf/oneOf/$ref/allOf/not/const/type 数组全塞进一个工具 schema，断言不出现
+  错误帧且收到 `finish_reason`；② 断言工具调用能完整回来、参数是合法 JSON。
+  本地没有 `WPS_LINGXI_COOKIE` 时自动跳过（`skipped 2`），CI 由仓库 secret 注入，
+  fork PR 拿不到 secret 也只会跳过。
+- 测试 62 通过 + 2 条真上游（有 cookie 时）。
+
+## 0.4.9 — 2026-10-31
+
+- **schema 压平：多分支时保留信息量最大的那一支**。`anyOf: [string, object]` 这类
+  真联合以前固定取第一个非 null 分支，会退化成只能传字符串、丢掉对象字段名；
+  现在按 object > array > 标量排序取，同档位保持原顺序（新增 3 条断言）。
+  注意 `report_view` 里的 `anyOf` 都是 `[真类型, null]`，行为不变。
+- **修 CI 红**：`cookie-login.test.mjs` 里「一个域名挂住」的桩只挂了一个悬着的
+  promise，而 `AbortSignal.timeout()` 的定时器是 unref 的 —— 事件循环提前清空，
+  Linux 上整条测试被判 `cancelledByParent`（Windows 本地有别的句柄撑着，看不出来）。
+  桩里加一个 ref 的 keep-alive 定时器，abort 时清掉。
+- 测试 62 条全绿。
+
+## 0.4.8 — 2026-10-31
+
+- **修 0.4.7 引入的误判**：共用一份超时预算后，若 `wps.cn` 挂满 20s，`kdocs.cn`
+  会被直接跳过，只在 kdocs 站有效的 Cookie 就被判「无效」。改成**两个域名并发**
+  校验（`Promise.all`）：总耗时仍是一份预算，但两边都会真试到，取 `wps.cn` 优先。
+  新增测试覆盖「wps.cn 挂住 + kdocs 有效」这条路径。
+- **`probeBase` 收敛到 `verifyCookie`**：旧实现只认 `response.ok`，会把
+  `200 + UserUnauthorized` 当成功，且与 `verifyCookie` 是同一件事的两套判据；
+  现在直接复用（客户端导入、浏览器登录两处调用行为一致，且多了超时保护）。
+- 测试 61 条全绿。
+
+## 0.4.7 — 2026-10-31
+
+- **`verifyCookie` 的总超时改成两个域名共用一份**：原来是每个域名各等 20s，
+  粘错 Cookie 时最坏 40s 才报错；现在共用 20s 预算，第二个域名没预算就跳过，
+  跳过原因也写进 `tried` 给用户看（新增一条测试覆盖）。
+- **测试去掉硬编码下标**：`cookie-login.test.mjs` 原来断言 `methods.length === 3`
+  且直接取 `methods[2]`，再加登录路就会误报；改成按 label 查找（仍校验兜底项排在最后）。
+- 测试 60 条全绿。
+
+## 0.4.6 — 2026-10-31
+
+- **粘贴 Cookie 登录（第三条登录路，PR #8 by 411304344）**：`auth.methods` 末尾新增
+  「粘贴 Cookie 登录（wps_sid）」，补上浏览器登录、客户端导入都走不通的场景（没装客户端、
+  浏览器不支持调试端口、别人的机器上临时用）。输入框只做本地格式校验；`authorize()`
+  立刻返回，网络校验放 `callback()`（避免与 magpie 互锁）；校验走
+  `GET /api/public/v1/account/profile`，只认 200 且不是 `UserUnauthorized`，
+  `wps.cn` 不通自动回落 `kdocs.cn`，失败信息带上两个域名各自的 HTTP 结果。
+  凭据仍只保留 `wps_sid` + `uid`，与另两条路识别成同一个账号。
+- 测试 59 条全绿（新增 9 条）。
+
 ## 0.4.5 — 2026-10-31
 
 - **工具 schema 压平（修 `AIError：AI服务异常`）**：上游 agent-runtime 的 schema

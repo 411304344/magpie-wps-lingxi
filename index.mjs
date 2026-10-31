@@ -288,15 +288,37 @@ function resolveBase(auth) {
   return host || BASE
 }
 
-// 登录后探测哪个域名接受这把 Cookie（wps.cn / kdocs.cn 是同一账号的两套站）。
-async function probeBase(cookie) {
-  for (const base of [BASE, KDOCS_BASE]) {
-    try {
-      const response = await fetch(`${base}/api/public/v1/credits/balance`, { headers: basicHeaders(cookie, base) })
-      if (response.ok) return base
-    } catch {}
+// 手填 Cookie 登录的校验：profile 接口能读出账号信息才算这把 Cookie 真的可用。
+// 只认 200 + 不是 UserUnauthorized；两个域名并发试（同一把 Cookie 在两套站上都可能有效），
+// 都认才取 wps.cn。并发的好处：总耗时不超过 timeoutMs，也不会因为一个域名挂住
+// 就把另一个域名上的有效 Cookie 判死。
+async function verifyHost(cookie, base, timeoutMs) {
+  try {
+    const response = await fetch(`${base}/api/public/v1/account/profile`, {
+      headers: basicHeaders(cookie, base),
+      signal: AbortSignal.timeout(timeoutMs),
+    })
+    if (!response.ok) return { base, ok: false, note: `HTTP ${response.status}` }
+    const json = await response.json().catch(() => ({}))
+    if (json?.result === "UserUnauthorized") return { base, ok: false, note: "HTTP 200 UserUnauthorized" }
+    return { base, ok: true, note: `HTTP ${response.status}`, name: String(json?.data?.name ?? "").trim() }
+  } catch (error) {
+    return { base, ok: false, note: String(error?.message || error).slice(0, 60) }
   }
-  return BASE
+}
+
+async function verifyCookie(cookie, { timeoutMs = 20000 } = {}) {
+  const results = await Promise.all([BASE, KDOCS_BASE].map((base) => verifyHost(cookie, base, timeoutMs)))
+  const winner = results.find((item) => item.ok)
+  if (winner) return { ok: true, host: winner.base, name: winner.name }
+  return { ok: false, tried: results.map((item) => `${item.base} → ${item.note}`) }
+}
+
+// 登录后探测哪个域名接受这把 Cookie —— 就是 verifyCookie 的 host 部分，
+// 别为同一件事留第二套判据（旧版只认 response.ok，会把 200+UserUnauthorized 当成功）。
+async function probeBase(cookie) {
+  const result = await verifyCookie(cookie)
+  return result.host || BASE
 }
 
 // ── 浏览器自动登录（Chrome/Edge CDP 抓 wps_sid）────────────────────────
@@ -758,11 +780,12 @@ function sanitizeSchema(node, root = node, seen = new Set()) {
     out[key] = sanitizeSchema(value, root, seen)
   }
 
-  // allOf 全都要满足，合并；anyOf/oneOf 取第一个非 null 的分支；节点自身的键最优先。
+  // allOf 全都要满足，合并；anyOf/oneOf 只能留一支，取信息量最大的，节点自身的键最优先。
   const both = allOf.length ? Object.assign({}, ...allOf.map((branch) => sanitizeSchema(branch, root, seen))) : {}
   const picked = anyOf
     .map((branch) => sanitizeSchema(branch, root, seen))
-    .find((branch) => branch && branch.type !== "null")
+    .filter((branch) => branch && branch.type !== "null")
+    .reduce((best, branch) => (!best || schemaRank(branch) > schemaRank(best) ? branch : best), null)
   const merged = { ...both, ...picked, ...out }
 
   if (Array.isArray(merged.type)) {
@@ -774,6 +797,15 @@ function sanitizeSchema(node, root = node, seen = new Set()) {
   // 上游要求每个 schema 都带 type：空的、只有 description 的、只有 enum 的都会回 AIError。
   if (!merged.type) merged.type = inferSchemaType(merged)
   return merged
+}
+
+// anyOf/oneOf 里可能有两个都非 null 的分支（如 string | object）。上游只认单一 type，
+// 只能留一支：选信息量最大的那个——对象分支通常带 properties，丢了模型就不知道字段名，
+// 比退化成字符串更难用。
+function schemaRank(node) {
+  if (node.type === "object" || node.properties) return 3
+  if (node.type === "array" || node.items) return 2
+  return 1
 }
 
 function inferSchemaType(node) {
@@ -937,10 +969,16 @@ function buildAgentBody(body, model) {
 // 这里统一成 magpie 认的形状，别把缓存命中丢掉。
 function normalizeUsage(usage) {
   if (!usage || typeof usage !== "object") return null
+  const prompt = Number(usage.prompt_tokens ?? 0) || 0
+  const completion = Number(usage.completion_tokens ?? 0) || 0
   const out = {
-    prompt_tokens: Number(usage.prompt_tokens ?? 0) || 0,
-    completion_tokens: Number(usage.completion_tokens ?? 0) || 0,
-    total_tokens: Number(usage.total_tokens ?? 0) || 0,
+    prompt_tokens: prompt,
+    completion_tokens: completion,
+    // 上游的 total_tokens 不是本轮用量，而是「当前上下文大小」
+    // （实测 42240 cache + 1097 prompt + 226 completion = 43563）：原样透传会让客户端
+    // 拿它当每轮用量累加，会话总量虚高几十倍、TPS 算出两万多 tok/s。
+    // 和 magpie 其它插件一致：自己按 prompt + completion 算。
+    total_tokens: prompt + completion,
   }
   const cached = Number(usage.cached_tokens ?? usage.prompt_tokens_details?.cached_tokens ?? 0)
   if (cached > 0) out.prompt_tokens_details = { cached_tokens: cached }
@@ -2247,6 +2285,70 @@ export async function WPSLingxiAuthPlugin(input = {}, options = {}) {
             }
           },
         },
+        {
+          // 兜底的手填方式：浏览器登录、客户端导入都走不通时（没装客户端、浏览器不支持
+          // 调试端口、或在别人的机器上临时用），用户从浏览器 DevTools 里复制 wps_sid
+          // （或整段 Cookie）直接粘进来。纯 HTTP 校验，不拉浏览器、不开页面。
+          type: "oauth",
+          label: "粘贴 Cookie 登录（wps_sid）",
+          prompts: [
+            {
+              type: "text",
+              key: "cookie",
+              message: "WPS 的 wps_sid（也可粘整段 Cookie：wps_sid=…; uid=…）",
+              placeholder: "wps_sid=…; uid=…",
+              // 只在本地做格式校验，不发网络请求；返回字符串即错误信息，undefined 为通过。
+              validate: (value) => normalizeCredential(value)?.error,
+            },
+          ],
+          async authorize(inputs) {
+            const raw = String(inputs?.cookie ?? inputs?.key ?? "")
+            const cred = normalizeCredential(raw)
+            // authorize 里失败只能抛异常：return { type: "failed" } 会被 magpie 当成
+            // 登录流程对象去调 .callback()，崩在 "callback is not a function"。
+            if (cred?.error) throw new Error(cred.error)
+
+            // 立刻返回，网络校验放 callback（在 authorize 里死等会和 magpie 互锁）。
+            const probe = verifyCookie(cred.cookie)
+
+            return {
+              url: `${BASE}/`,
+              instructions: "正在校验这把 Cookie…",
+              method: "auto",
+              // 全程纯 HTTP，没开任何页面；opened:true 让 magpie 别再拉浏览器。
+              opened: true,
+              async callback() {
+                let result
+                try {
+                  result = await probe
+                } catch (error) {
+                  return { type: "failed", error: String(error?.message || error) }
+                }
+                if (!result.ok) {
+                  const detail = result.tried?.length ? `（${result.tried.join("；")}）` : ""
+                  return { type: "failed", error: `Cookie 无效或已过期${detail}` }
+                }
+                return {
+                  type: "success",
+                  access: cred.sid,
+                  refresh: "",
+                  // Cookie 约一年有效；没有刷新接口，真正的判据是上游 401。
+                  expires: Date.now() + 360 * 24 * 3600 * 1000,
+                  cookie: cred.cookie,
+                  accountId: cred.accountId,
+                  metadata: {
+                    sid: cred.sid,
+                    uid: cred.uid,
+                    cookieTail: cred.tail,
+                    cookie: cred.cookie,
+                    accountId: cred.accountId,
+                    host: result.host,
+                  },
+                }
+              },
+            }
+          },
+        },
       ],
     },
   }
@@ -2262,6 +2364,7 @@ export const _internal = {
   extractUid,
   identityOf,
   normalizeCredential,
+  verifyCookie,
   resolveCookie,
   resolveBase,
   findBrowser,
@@ -2281,6 +2384,7 @@ export const _internal = {
   deleteGroupChat,
   agentChat,
   sanitizeSchema,
+  normalizeUsage,
   filterTools,
   browserLogin,
   safariLogin,
