@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.4.4 — 2026-10-31
+
+- **网关等待耐心（patience=240）**：慢思考模型（kimi-k3.1-pro 等）对大提示词的
+  首字延迟可超 110s，magpie 默认 60s 会把"上游失联"判成 502 并重试到尽
+  （实测 10 次/37 秒失败）。插件现于 config 钩子声明 `patience: 240`
+  （magpie 的 PatienceLongest），用户零配置；显式设置过 `patience` 的不被覆盖。
+- 复测提示：若 magpie 里已装旧版本，升级后需重载插件使 config 钩子生效。
+- 测试 38 条全绿（新增 patience 两断言）。
+
 ## 0.4.3 — 2026-10-31
 
 - **macOS 客户端导入**（移植 PR #6，shadyrispy 真机验证）：目录判据放宽为

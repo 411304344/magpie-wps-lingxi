@@ -1815,6 +1815,10 @@ export async function WPSLingxiAuthPlugin(input = {}, options = {}) {
       p.name ??= "WPS 灵犀"
       p.npm ??= NPM
       p.api ??= `${BASE}/api`
+      // 网关等待耐心：kimi-k3.1-pro 等慢思考模型对大提示词的首字延迟可超 110s，
+      // magpie 默认 60s 就把"上游失联"判成 502（fallback.go lastRetries=2 + 60s patience）。
+      // 240s 是 magpie 的 PatienceLongest 上限；用户显式设置过则不覆盖。
+      p.patience ??= 240
       // the variants are this plugin's own, not those a host stored from an
       // earlier release (an array, whose keys it read as "0", "1", "2"); a
       // model this plugin doesn't define is left without them, which a host
