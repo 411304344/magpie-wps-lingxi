@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.4.5 — 2026-10-31
+
+- **工具 schema 压平（修 `AIError：AI服务异常`）**：上游 agent-runtime 的 schema
+  转换器只认朴素 JSON Schema，实测逐条验证——工具参数里出现 `anyOf` / `oneOf` /
+  `allOf` / `not` / `const` / `$ref`，或 `type` 写成数组，整条对话必挂：
+  前六者回 `AIError：AI服务异常`（HTTP 200 + 错误帧，<1s），`type` 数组回
+  400 `InvalidArgument`。ZCode 的 MCP 工具（documents/pdf 的 `report_view` 等）
+  就带 `anyOf`，所以任何模型（ds4.1f、kimi…）在 ZCode 里都必失败，而脚本直连
+  不开工具却能通——这正是「ds4.1f 也报这个错」的根因。
+  插件现在发送前压平工具 schema：组合关键字取首个非 null 分支 / 合并，`const`
+  转 `enum`，`$ref` 从 `$defs` 解析（递归安全），`type` 数组取单值，缺 `type`
+  的节点按 properties/items/enum 补出可用类型（上游要求每个节点都有 type）。
+- 实测：8 种被拒写法 + 真实 `report_view` schema 全部 200；新增 12 条单测，
+  全套 50 条全绿。
+
 ## 0.4.4 — 2026-10-31
 
 - **网关等待耐心（patience=240）**：慢思考模型（kimi-k3.1-pro 等）对大提示词的

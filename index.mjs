@@ -710,14 +710,92 @@ function wireModel(value) {
   return !model || model === "default" ? "deepseek-v4.1-flash" : model
 }
 
+// 上游的 schema 转换器只认最朴素的 JSON Schema（实测逐条验证）：
+// anyOf / oneOf / allOf / not / const / $ref 会让 chat 直接回 AIError（AI服务异常），
+// type 用数组则回 400 InvalidArgument —— ZCode 的 MCP 工具（documents/pdf 的 report_view）就带 anyOf，
+// 整条请求因此必挂。这里把这些压平成上游认的形状：宁可参数变宽，也别让对话失败。
+
+function resolveSchemaRef(ref, root, seen) {
+  const pointer = String(ref ?? "")
+  if (!pointer.startsWith("#/") || seen.has(pointer)) return {}
+  const target = pointer.slice(2).split("/").reduce(
+    (node, key) => node?.[key.replace(/~1/g, "/").replace(/~0/g, "~")],
+    root,
+  )
+  if (!target || typeof target !== "object") return {}
+  seen.add(pointer)
+  const resolved = sanitizeSchema(target, root, seen)
+  seen.delete(pointer)
+  return resolved
+}
+
+function sanitizeSchema(node, root = node, seen = new Set()) {
+  if (Array.isArray(node)) return node.map((item) => sanitizeSchema(item, root, seen))
+  if (!node || typeof node !== "object") return node
+
+  const out = {}
+  const anyOf = []
+  const allOf = []
+  for (const [key, value] of Object.entries(node)) {
+    if (key === "anyOf" || key === "oneOf") {
+      if (Array.isArray(value)) anyOf.push(...value)
+      continue
+    }
+    if (key === "allOf") {
+      if (Array.isArray(value)) allOf.push(...value)
+      continue
+    }
+    if (key === "not" || key === "$defs" || key === "definitions") continue
+    if (key === "const") { out.enum = [value]; continue }
+    if (key === "$ref") { Object.assign(out, resolveSchemaRef(value, root, seen)); continue }
+    // properties/patternProperties 是「名字到 schema」的表，本身不是 schema，别给它补 type。
+    if ((key === "properties" || key === "patternProperties") && value && typeof value === "object") {
+      out[key] = Object.fromEntries(
+        Object.entries(value).map(([name, schema]) => [name, sanitizeSchema(schema, root, seen)]),
+      )
+      continue
+    }
+    out[key] = sanitizeSchema(value, root, seen)
+  }
+
+  // allOf 全都要满足，合并；anyOf/oneOf 取第一个非 null 的分支；节点自身的键最优先。
+  const both = allOf.length ? Object.assign({}, ...allOf.map((branch) => sanitizeSchema(branch, root, seen))) : {}
+  const picked = anyOf
+    .map((branch) => sanitizeSchema(branch, root, seen))
+    .find((branch) => branch && branch.type !== "null")
+  const merged = { ...both, ...picked, ...out }
+
+  if (Array.isArray(merged.type)) {
+    const type = merged.type.find((item) => item !== "null")
+    if (type) merged.type = type
+    else delete merged.type
+  }
+  if (merged.type === "null") delete merged.type
+  // 上游要求每个 schema 都带 type：空的、只有 description 的、只有 enum 的都会回 AIError。
+  if (!merged.type) merged.type = inferSchemaType(merged)
+  return merged
+}
+
+function inferSchemaType(node) {
+  if (node.properties || node.required || node.additionalProperties) return "object"
+  if (node.items) return "array"
+  const sample = Array.isArray(node.enum) ? node.enum[0] : undefined
+  if (typeof sample === "number") return "number"
+  if (typeof sample === "boolean") return "boolean"
+  return "string"
+}
+
 function filterTools(value) {
   const items = Array.isArray(value) ? value : []
   const kept = []
   let dropped = 0
   for (const item of items) {
     const name = item?.function?.name
-    if (item?.type === "function" && typeof name === "string" && name.trim()) kept.push(item)
-    else dropped += 1
+    if (item?.type !== "function" || typeof name !== "string" || !name.trim()) { dropped += 1; continue }
+    const parameters = item.function.parameters
+    kept.push(parameters && typeof parameters === "object"
+      ? { ...item, function: { ...item.function, parameters: sanitizeSchema(parameters) } }
+      : item)
   }
   return { tools: kept, dropped }
 }
@@ -2202,6 +2280,8 @@ export const _internal = {
   createGroupChatWith,
   deleteGroupChat,
   agentChat,
+  sanitizeSchema,
+  filterTools,
   browserLogin,
   safariLogin,
   chromiumLogin,
