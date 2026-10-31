@@ -299,6 +299,30 @@ async function probeBase(cookie) {
   return BASE
 }
 
+// 手填 Cookie 登录的校验：profile 接口能读出账号信息才算这把 Cookie 真的可用。
+// 只认 200 + 不是 UserUnauthorized；401/403/其它状态一律换下一个域名再试，
+// 两个域名都不认才判定失效（这样 kdocs 站登录的账号也能用同一把 Cookie 进来）。
+async function verifyCookie(cookie, { timeoutMs = 20000 } = {}) {
+  const tried = []
+  for (const base of [BASE, KDOCS_BASE]) {
+    try {
+      const response = await fetch(`${base}/api/public/v1/account/profile`, {
+        headers: basicHeaders(cookie, base),
+        signal: AbortSignal.timeout(timeoutMs),
+      })
+      tried.push(`${base} → HTTP ${response.status}`)
+      if (!response.ok) continue
+      const json = await response.json().catch(() => ({}))
+      if (json?.result === "UserUnauthorized") continue
+      const name = String(json?.data?.name ?? "").trim()
+      return { ok: true, host: base, name }
+    } catch (error) {
+      tried.push(`${base} → ${String(error?.message || error).slice(0, 60)}`)
+    }
+  }
+  return { ok: false, tried }
+}
+
 // ── 浏览器自动登录（Chrome/Edge CDP 抓 wps_sid）────────────────────────
 // 打开一个独立的浏览器配置目录，让用户在正常网页里登录，登录后从
 // DevTools 协议读 Cookie —— 不需要手动复制；找不到浏览器时回落到粘贴。
@@ -2247,6 +2271,70 @@ export async function WPSLingxiAuthPlugin(input = {}, options = {}) {
             }
           },
         },
+        {
+          // 兜底的手填方式：浏览器登录、客户端导入都走不通时（没装客户端、浏览器不支持
+          // 调试端口、或在别人的机器上临时用），用户从浏览器 DevTools 里复制 wps_sid
+          // （或整段 Cookie）直接粘进来。纯 HTTP 校验，不拉浏览器、不开页面。
+          type: "oauth",
+          label: "粘贴 Cookie 登录（wps_sid）",
+          prompts: [
+            {
+              type: "text",
+              key: "cookie",
+              message: "WPS 的 wps_sid（也可粘整段 Cookie：wps_sid=…; uid=…）",
+              placeholder: "wps_sid=…; uid=…",
+              // 只在本地做格式校验，不发网络请求；返回字符串即错误信息，undefined 为通过。
+              validate: (value) => normalizeCredential(value)?.error,
+            },
+          ],
+          async authorize(inputs) {
+            const raw = String(inputs?.cookie ?? inputs?.key ?? "")
+            const cred = normalizeCredential(raw)
+            // authorize 里失败只能抛异常：return { type: "failed" } 会被 magpie 当成
+            // 登录流程对象去调 .callback()，崩在 "callback is not a function"。
+            if (cred?.error) throw new Error(cred.error)
+
+            // 立刻返回，网络校验放 callback（在 authorize 里死等会和 magpie 互锁）。
+            const probe = verifyCookie(cred.cookie)
+
+            return {
+              url: `${BASE}/`,
+              instructions: "正在校验这把 Cookie…",
+              method: "auto",
+              // 全程纯 HTTP，没开任何页面；opened:true 让 magpie 别再拉浏览器。
+              opened: true,
+              async callback() {
+                let result
+                try {
+                  result = await probe
+                } catch (error) {
+                  return { type: "failed", error: String(error?.message || error) }
+                }
+                if (!result.ok) {
+                  const detail = result.tried?.length ? `（${result.tried.join("；")}）` : ""
+                  return { type: "failed", error: `Cookie 无效或已过期${detail}` }
+                }
+                return {
+                  type: "success",
+                  access: cred.sid,
+                  refresh: "",
+                  // Cookie 约一年有效；没有刷新接口，真正的判据是上游 401。
+                  expires: Date.now() + 360 * 24 * 3600 * 1000,
+                  cookie: cred.cookie,
+                  accountId: cred.accountId,
+                  metadata: {
+                    sid: cred.sid,
+                    uid: cred.uid,
+                    cookieTail: cred.tail,
+                    cookie: cred.cookie,
+                    accountId: cred.accountId,
+                    host: result.host,
+                  },
+                }
+              },
+            }
+          },
+        },
       ],
     },
   }
@@ -2262,6 +2350,7 @@ export const _internal = {
   extractUid,
   identityOf,
   normalizeCredential,
+  verifyCookie,
   resolveCookie,
   resolveBase,
   findBrowser,

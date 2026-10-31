@@ -48,7 +48,8 @@ Claude Code、Codex、Cursor 等任何支持 OpenAI 格式的客户端。
   只读客户端自己的 `GET /api/aioffice/v1/sessions/plans`（`plans` + `models`，带倍率与推理档位）；
   未登录时用手指量的快照，不假装实时。
 - 🔑 **账号导入 + 多账号**  
-  浏览器登录会自己抓会话；也可以直接导入本机灵犀客户端的登录态（Windows，读客户端 Cookie 库）。
+  三条登录路：浏览器登录自己抓会话、导入本机灵犀客户端登录态（Windows，读客户端 Cookie 库）、
+  或直接粘贴 `wps_sid` / 整段 Cookie 兜底。
   凭据只保留 `wps_sid` 与 `uid`，按 `uid` 区分账号，第二个账号不会覆盖第一个。
 
 ---
@@ -144,6 +145,12 @@ magpie plugin login wps-lingxi
    不打开浏览器、不用重新登录、也不用填任何路径（自动扫描客户端数据目录；Windows
    用 DPAPI + AES-GCM 解密客户端 Cookie 库，macOS 的客户端 Cookie 本身就是明文存储、
    直接读取即可 —— 1.3.27 / 1.3.31 实测，需 Node 22+）。
+3. **粘贴 Cookie 登录（兜底）**：上面两条都走不通时（没装客户端、浏览器不支持调试端口、
+   或在别人的机器上临时用），选这一项粘贴 `wps_sid` 或整段 Cookie 即可 ——
+   从浏览器 DevTools 的 Application → Cookies 里复制 `wps_sid`，或直接粘 `Cookie:` 那一行。
+   插件只保留 `wps_sid` + `uid` 两个键，`lang` / `kso_sid` / `rtk` 这类噪声一律丢掉；
+   提交时先打上游 `account/profile` 验一次（`wps.cn` 不通自动回落 `kdocs.cn`），
+   粘错了当场报「Cookie 无效或已过期」，不会把一个坏账号存进列表。
 
 多账号：凭据按 `uid` 区分（没有 `uid` 时按 `wps_sid` 尾部），界面显示尾号 4 位。
 
